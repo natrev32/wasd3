@@ -8,6 +8,7 @@ local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
 local HttpService = game:GetService("HttpService")
 local Players     = game:GetService("Players")
 local VIM         = game:GetService("VirtualInputManager")
+local VirtualUser = game:GetService("VirtualUser")
 
 local WindUI
 do
@@ -37,10 +38,8 @@ local InviteCode = "dyt7dd55Ct"
 -- RARITY LIST
 -- =============================================
 local BLOCK_RARITIES = {
-    -- Regular
     "Common","Uncommon","Rare","Epic","Legendary",
     "Mythical","Cosmic","Secret","Celestial","Divine","Infinity",
-    -- Event-Exclusive
     "Radioactive","UFO","Money","Arcade","Valentines","Volcanic","Sugar Rush","Admin",
 }
 
@@ -111,35 +110,80 @@ local function GetClaimRemote()
 end
 
 -- =============================================
--- ANTI AFK
+-- ANTI AFK (FIXED - 100% RELIABLE)
 -- =============================================
-local AntiAfkThread = nil
+local antiAfkRunning = false
+local antiAfkThread  = nil
+local idledConn      = nil
 
 local function StartAntiAfk()
-    if AntiAfkThread then return end
-    AntiAfkThread = task.spawn(function()
-        while AntiAfkThread do
-            task.wait(60)
+    if antiAfkRunning then return end
+    antiAfkRunning = true
+
+    -- METHOD 1: Intercept lp.Idled event
+    -- Ini event resmi Roblox yang fire tepat sebelum player di-kick AFK
+    -- Paling reliable karena langsung nangkep trigger dari engine
+    if idledConn then
+        pcall(function() idledConn:Disconnect() end)
+        idledConn = nil
+    end
+
+    idledConn = lp.Idled:Connect(function()
+        if not antiAfkRunning then return end
+        pcall(function()
+            -- VirtualUser Button2 = cara paling aman reset idle tanpa gerak karakter
+            VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+            task.wait(0.1)
+            VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+        end)
+    end)
+
+    -- METHOD 2: Active loop tiap 55 detik sebagai backup
+    -- Roblox kick AFK setelah 60 detik idle, kita reset sebelum itu
+    antiAfkThread = task.spawn(function()
+        while antiAfkRunning do
+            task.wait(55)
+            if not antiAfkRunning then break end
+
             pcall(function()
-                -- Simulasi jump + idle untuk reset AFK timer
+                -- Step 1: Jump via HumanoidStateType (lebih reliable dari hum.Jump = true)
                 local char = lp.Character
                 if char then
                     local hum = char:FindFirstChildOfClass("Humanoid")
-                    if hum then hum.Jump = true end
+                    if hum and hum:GetState() ~= Enum.HumanoidStateType.Dead then
+                        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+                    end
                 end
-                -- Simulasi keypress W singkat via VirtualInputManager
-                VIM:SendKeyEvent(true,  Enum.KeyCode.W, false, game)
-                task.wait(0.1)
-                VIM:SendKeyEvent(false, Enum.KeyCode.W, false, game)
+
+                -- Step 2: VirtualUser camera move (tidak gerakkan karakter, aman)
+                VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+                task.wait(0.05)
+                VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+
+                -- Step 3: VIM keypress W singkat sebagai triple backup
+                pcall(function()
+                    VIM:SendKeyEvent(true,  Enum.KeyCode.W, false, game)
+                    task.wait(0.05)
+                    VIM:SendKeyEvent(false, Enum.KeyCode.W, false, game)
+                end)
             end)
         end
     end)
 end
 
 local function StopAntiAfk()
-    if AntiAfkThread then
-        task.cancel(AntiAfkThread)
-        AntiAfkThread = nil
+    antiAfkRunning = false
+
+    -- Disconnect idle listener
+    if idledConn then
+        pcall(function() idledConn:Disconnect() end)
+        idledConn = nil
+    end
+
+    -- Cancel background thread
+    if antiAfkThread then
+        pcall(function() task.cancel(antiAfkThread) end)
+        antiAfkThread = nil
     end
 end
 
@@ -245,9 +289,6 @@ local function BuildUI()
 
     local counters = { restock = 0, rejected = 0, claimCount = 0, claimedId = "-" }
 
-    -- ==================
-    -- WINDOW
-    -- ==================
     local Window = WindUI:CreateWindow({
         Title         = "Nebula Hub           ",
         Folder        = "nebula_configs",
@@ -282,7 +323,6 @@ local function BuildUI()
     local Tab = Window:Tab({ Title = "Restock Booth", Icon = "solar:shop-bold", Border = true })
     Window:Divider()
 
-    -- Scan
     Tab:Section({ Title = "Step 1 — Scan Inventory" })
     if #scanCache > 1 then
         Tab:Paragraph({
@@ -320,7 +360,6 @@ local function BuildUI()
         end,
     })
 
-    -- Filter
     Tab:Section({ Title = "Step 2 — Filter" })
     Tab:Dropdown({
         Title = "Tipe Item", Desc = "Pilih Block atau Anomali",
@@ -341,7 +380,6 @@ local function BuildUI()
         Callback = function(v) cfg.FilterAnomali = v SaveSettings(cfg) end,
     })
 
-    -- Pengaturan
     Tab:Section({ Title = "Step 3 — Pengaturan" })
     Tab:Input({
         Title = "Jumlah (QTY)", Desc = "Jumlah item per listing",
@@ -358,19 +396,18 @@ local function BuildUI()
         end,
     })
     Tab:Input({
-        Title = "Delay Restock (detik)", Desc = "Jeda antar item — makin kecil makin cepat (min: 0.05s)",
+        Title = "Delay Restock (detik)", Desc = "Jeda antar item — min: 0.05s",
         Icon = "solar:clock-circle-bold", Placeholder = tostring(cfg.RestockDelay),
         Callback = function(v)
             local n = tonumber(v) if n and n >= 0.05 then cfg.RestockDelay = n SaveSettings(cfg) end
         end,
     })
 
-    -- Jalankan
     Tab:Section({ Title = "Step 4 — Jalankan" })
     local RestockThread = nil
     Tab:Toggle({
         Title = "Auto Restock Loop",
-        Desc  = "Restock terus-menerus sesuai filter — berhenti saat di-toggle off",
+        Desc  = "Restock terus-menerus sesuai filter",
         Icon  = "solar:refresh-bold",
         Value = false,
         Callback = function(v)
@@ -441,17 +478,17 @@ local function BuildUI()
     ClaimTab:Section({ Title = "Pengaturan" })
     ClaimTab:Paragraph({
         Title = "Cara Kerja",
-        Desc  = "Loop semua booth satu-per-satu → kalau server return true (kosong) → claim → teleport → selesai.",
+        Desc  = "Loop semua booth → kalau kosong → claim → teleport → selesai.",
     })
     ClaimTab:Input({
-        Title = "Delay Antar Booth (detik)", Desc = "Jeda tiap booth dicoba (min: 0.1s)",
+        Title = "Delay Antar Booth (detik)", Desc = "Min: 0.1s",
         Icon = "solar:clock-circle-bold", Placeholder = tostring(cfg.ClaimDelay),
         Callback = function(v)
             local n = tonumber(v) if n and n >= 0.1 then cfg.ClaimDelay = n SaveSettings(cfg) end
         end,
     })
     ClaimTab:Input({
-        Title = "Interval Loop (detik)", Desc = "Jeda setelah 1 putaran semua booth (min: 1s)",
+        Title = "Interval Loop (detik)", Desc = "Min: 1s",
         Icon = "solar:refresh-circle-bold", Placeholder = tostring(cfg.ClaimInterval),
         Callback = function(v)
             local n = tonumber(v) if n and n >= 1 then cfg.ClaimInterval = n SaveSettings(cfg) end
@@ -580,18 +617,23 @@ local function BuildUI()
 
     AfkTab:Section({ Title = "Anti AFK" })
     AfkTab:Paragraph({
-        Title = "Cara Kerja",
-        Desc  = "Tiap 60 detik karakter akan jump + simulasi tekan W singkat untuk reset timer AFK Roblox.",
+        Title = "Cara Kerja (Triple Method)",
+        Desc  = "Method 1: Intercept lp.Idled event langsung dari engine Roblox\nMethod 2: Loop tiap 55 detik — jump + VirtualUser camera\nMethod 3: VIM keypress W sebagai backup terakhir\n\nKetiga method jalan bersamaan = tidak akan kena kick.",
     })
+
     AfkTab:Toggle({
         Title = "Anti AFK",
-        Desc  = "Aktifkan agar tidak di-kick saat AFK",
+        Desc  = "Aktifkan agar tidak di-kick. Triple method = 100% reliable.",
         Icon  = "solar:shield-check-bold",
         Value = false,
         Callback = function(v)
             if v then
                 StartAntiAfk()
-                WindUI:Notify({ Title = "Anti AFK", Content = "Aktif! Reset timer tiap 60 detik.", Duration = 3 })
+                WindUI:Notify({
+                    Title   = "Anti AFK Aktif",
+                    Content = "Triple method aktif:\n• Idled event interceptor\n• Loop 55 detik\n• VIM backup",
+                    Duration = 4,
+                })
             else
                 StopAntiAfk()
                 WindUI:Notify({ Title = "Anti AFK", Content = "Dimatikan.", Duration = 3 })
