@@ -1,5 +1,5 @@
 -- Nebula Hub v18.9 – Midnight Nebula Edition
--- Feature: Auto Restock Booth + Auto Claim Booth + Anti AFK
+-- Feature: Auto Restock Booth + Auto Claim Booth + Anti AFK + Auto Trade
 -- Authority: iPowfu | Channel: Nebula Hub
 
 local RunService = game:GetService("RunService")
@@ -51,14 +51,30 @@ local SCAN_FILE     = "NebulaHub_ScanCache.json"
 
 local function LoadSettings()
     local d = {
-        SellType      = "Block",
-        FilterRarity  = "Common",
-        FilterAnomali = "All",
-        StockAmount   = 100,
-        StockPrice    = 100,
-        RestockDelay  = 0.2,
+        -- Restock
+        SellType        = "Block",
+        FilterRarity    = "Common",
+        FilterAnomali   = "All",
+        FilterMutation  = "All",
+        FilterLevelMin  = 0,
+        FilterLevelMax  = 9999,
+        StockAmount     = 100,
+        StockPrice      = 100,
+        RestockDelay    = 0.2,
+        -- Claim
         ClaimDelay    = 0.5,
         ClaimInterval = 3,
+        -- Trade
+        TradeSellType     = "Block",
+        TradeRarity       = "Common",
+        TradeAnomali      = "All",
+        TradeMutation     = "All",
+        TradeLevelMin     = 0,
+        TradeLevelMax     = 9999,
+        TradeSlotCount    = 1,
+        TradeWaitAccept   = 5,
+        TradeWaitAfterAcc = 2,
+        TradeSendDelay    = 0.5,
     }
     if isfile and isfile(SETTINGS_FILE) then
         pcall(function()
@@ -85,7 +101,7 @@ local function LoadScanCache()
 end
 
 -- =============================================
--- REMOTES
+-- REMOTES (RESTOCK & CLAIM)
 -- =============================================
 local ListRemote, ClaimRemote
 
@@ -120,9 +136,6 @@ local function StartAntiAfk()
     if antiAfkRunning then return end
     antiAfkRunning = true
 
-    -- METHOD 1: Intercept lp.Idled event
-    -- Ini event resmi Roblox yang fire tepat sebelum player di-kick AFK
-    -- Paling reliable karena langsung nangkep trigger dari engine
     if idledConn then
         pcall(function() idledConn:Disconnect() end)
         idledConn = nil
@@ -131,22 +144,18 @@ local function StartAntiAfk()
     idledConn = lp.Idled:Connect(function()
         if not antiAfkRunning then return end
         pcall(function()
-            -- VirtualUser Button2 = cara paling aman reset idle tanpa gerak karakter
             VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
             task.wait(0.1)
             VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
         end)
     end)
 
-    -- METHOD 2: Active loop tiap 55 detik sebagai backup
-    -- Roblox kick AFK setelah 60 detik idle, kita reset sebelum itu
     antiAfkThread = task.spawn(function()
         while antiAfkRunning do
             task.wait(55)
             if not antiAfkRunning then break end
 
             pcall(function()
-                -- Step 1: Jump via HumanoidStateType (lebih reliable dari hum.Jump = true)
                 local char = lp.Character
                 if char then
                     local hum = char:FindFirstChildOfClass("Humanoid")
@@ -155,12 +164,10 @@ local function StartAntiAfk()
                     end
                 end
 
-                -- Step 2: VirtualUser camera move (tidak gerakkan karakter, aman)
                 VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
                 task.wait(0.05)
                 VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
 
-                -- Step 3: VIM keypress W singkat sebagai triple backup
                 pcall(function()
                     VIM:SendKeyEvent(true,  Enum.KeyCode.W, false, game)
                     task.wait(0.05)
@@ -174,13 +181,11 @@ end
 local function StopAntiAfk()
     antiAfkRunning = false
 
-    -- Disconnect idle listener
     if idledConn then
         pcall(function() idledConn:Disconnect() end)
         idledConn = nil
     end
 
-    -- Cancel background thread
     if antiAfkThread then
         pcall(function() task.cancel(antiAfkThread) end)
         antiAfkThread = nil
@@ -197,10 +202,12 @@ local function ScanInventory()
             local luckyType    = item:GetAttribute("LuckyBlockType")
             local brainrotName = item:GetAttribute("BrainrotName")
             local displayName  = item:GetAttribute("DisplayName") or item.Name
+            local mutation     = item:GetAttribute("Mutation") or "None"
+            local level        = tonumber(item:GetAttribute("Level")) or 0
             if luckyType and luckyType ~= "" then
-                table.insert(blocks, { id = item.Name, displayName = displayName, rarity = luckyType })
+                table.insert(blocks, { id = item.Name, displayName = displayName, rarity = luckyType, mutation = mutation, level = level })
             elseif brainrotName and brainrotName ~= "" then
-                table.insert(anomals, { id = item.Name, brainrotName = brainrotName, displayName = displayName })
+                table.insert(anomals, { id = item.Name, brainrotName = brainrotName, displayName = displayName, mutation = mutation, level = level })
             end
         end
     end)
@@ -326,13 +333,13 @@ local function BuildUI()
     Tab:Section({ Title = "Step 1 — Scan Inventory" })
     if #scanCache > 1 then
         Tab:Paragraph({
-            Title = "Cache scan tersedia",
-            Desc  = tostring(#scanCache - 1) .. " jenis anomali. Scan ulang untuk update.",
+            Title = "Cache tersedia",
+            Desc  = tostring(#scanCache - 1) .. " jenis anomali.",
         })
     else
         Tab:Paragraph({
-            Title = "Belum ada data scan",
-            Desc  = "Klik Scan untuk mendeteksi item di backpack.",
+            Title = "Belum di-scan",
+            Desc  = "Klik Scan untuk deteksi item.",
         })
     end
 
@@ -378,6 +385,47 @@ local function BuildUI()
         Icon = "solar:ufo-bold", Value = cfg.FilterAnomali,
         Values = anomaliValues, Multi = false, AllowNone = false,
         Callback = function(v) cfg.FilterAnomali = v SaveSettings(cfg) end,
+    })
+
+    -- Ambil list mutation dari ReplicatedStorage untuk restock
+    local restockMutList = { "All", "None" }
+    pcall(function()
+        local folder = ReplicatedStorage:WaitForChild("Assets", 3):WaitForChild("Mutations", 3)
+        local names = {}
+        for _, m in ipairs(folder:GetChildren()) do
+            if m:IsA("Folder") then
+                for _, sub in ipairs(m:GetChildren()) do table.insert(names, sub.Name) end
+            else
+                table.insert(names, m.Name)
+            end
+        end
+        table.sort(names)
+        for _, n in ipairs(names) do table.insert(restockMutList, n) end
+    end)
+    -- Validasi saved value
+    local rMutValid = false
+    for _, v in ipairs(restockMutList) do if v == cfg.FilterMutation then rMutValid = true break end end
+    if not rMutValid then cfg.FilterMutation = "All" end
+
+    Tab:Dropdown({
+        Title = "Mutation", Desc = "Filter mutation item (All = semua, None = tanpa mutation)",
+        Icon = "solar:atom-bold", Value = cfg.FilterMutation,
+        Values = restockMutList, Multi = false, AllowNone = false,
+        Callback = function(v) cfg.FilterMutation = v SaveSettings(cfg) end,
+    })
+    Tab:Input({
+        Title = "Level Minimum", Desc = "Hanya restock item level >= nilai ini (0 = semua)",
+        Icon = "solar:arrow-up-bold", Placeholder = tostring(cfg.FilterLevelMin),
+        Callback = function(v)
+            local n = tonumber(v) if n and n >= 0 then cfg.FilterLevelMin = math.floor(n) SaveSettings(cfg) end
+        end,
+    })
+    Tab:Input({
+        Title = "Level Maksimum", Desc = "Hanya restock item level <= nilai ini (9999 = semua)",
+        Icon = "solar:arrow-down-bold", Placeholder = tostring(cfg.FilterLevelMax),
+        Callback = function(v)
+            local n = tonumber(v) if n and n >= 0 then cfg.FilterLevelMax = math.floor(n) SaveSettings(cfg) end
+        end,
     })
 
     Tab:Section({ Title = "Step 3 — Pengaturan" })
@@ -431,15 +479,24 @@ local function BuildUI()
                         local items = {}
                         if cfg.SellType == "Block" then
                             for _, item in ipairs(blocks) do
-                                if string.lower(item.rarity) == string.lower(cfg.FilterRarity) then
+                                local rarityMatch = string.lower(item.rarity) == string.lower(cfg.FilterRarity)
+                                local mutMatch    = cfg.FilterMutation == "All"
+                                    or string.lower(item.mutation or "none") == string.lower(cfg.FilterMutation)
+                                local lvlMatch    = item.level >= cfg.FilterLevelMin and item.level <= cfg.FilterLevelMax
+                                if rarityMatch and mutMatch and lvlMatch then
                                     table.insert(items, item)
                                 end
                             end
                         else
                             for _, item in ipairs(anomals) do
-                                local match = cfg.FilterAnomali == "All"
+                                local nameMatch = cfg.FilterAnomali == "All"
                                     or string.lower(item.brainrotName) == string.lower(cfg.FilterAnomali)
-                                if match then table.insert(items, item) end
+                                local mutMatch  = cfg.FilterMutation == "All"
+                                    or string.lower(item.mutation or "none") == string.lower(cfg.FilterMutation)
+                                local lvlMatch  = item.level >= cfg.FilterLevelMin and item.level <= cfg.FilterLevelMax
+                                if nameMatch and mutMatch and lvlMatch then
+                                    table.insert(items, item)
+                                end
                             end
                         end
 
@@ -477,8 +534,8 @@ local function BuildUI()
 
     ClaimTab:Section({ Title = "Pengaturan" })
     ClaimTab:Paragraph({
-        Title = "Cara Kerja",
-        Desc  = "Loop semua booth → kalau kosong → claim → teleport → selesai.",
+        Title = "Claim Booth",
+        Desc  = "Scan semua booth, claim yang kosong, lalu teleport.",
     })
     ClaimTab:Input({
         Title = "Delay Antar Booth (detik)", Desc = "Min: 0.1s",
@@ -536,7 +593,7 @@ local function BuildUI()
     ClaimTab:Section({ Title = "Auto Claim Loop" })
     ClaimTab:Paragraph({
         Title = "Auto Loop",
-        Desc  = "Scan terus sampai dapat booth kosong → claim → teleport → berhenti otomatis.",
+        Desc  = "Loop terus sampai dapat booth kosong, lalu berhenti.",
     })
 
     local ClaimLoopThread = nil
@@ -617,8 +674,8 @@ local function BuildUI()
 
     AfkTab:Section({ Title = "Anti AFK" })
     AfkTab:Paragraph({
-        Title = "Cara Kerja (Triple Method)",
-        Desc  = "Method 1: Intercept lp.Idled event langsung dari engine Roblox\nMethod 2: Loop tiap 55 detik — jump + VirtualUser camera\nMethod 3: VIM keypress W sebagai backup terakhir\n\nKetiga method jalan bersamaan = tidak akan kena kick.",
+        Title = "Triple Method",
+        Desc  = "Idled event + loop 55 detik + VIM backup. Aktifkan agar tidak di-kick.",
     })
 
     AfkTab:Toggle({
@@ -638,6 +695,486 @@ local function BuildUI()
                 StopAntiAfk()
                 WindUI:Notify({ Title = "Anti AFK", Content = "Dimatikan.", Duration = 3 })
             end
+        end,
+    })
+
+    -- ==================
+    -- TAB TRADE
+    -- ==================
+    local TradeTab = Window:Tab({ Title = "Auto Trade", Icon = "solar:transfer-horizontal-bold", Border = true })
+
+    -- REMOTES TRADE
+    local TradeRemote, TradeSlotRemote, TradeReadyRemote
+
+    local function GetTradeRemote()
+        if TradeRemote then return TradeRemote end
+        pcall(function()
+            TradeRemote = ReplicatedStorage
+                :WaitForChild("Shared"):WaitForChild("Remotes")
+                :WaitForChild("Networking"):WaitForChild("RF/TradeSendTrade")
+        end)
+        return TradeRemote
+    end
+
+    local function GetTradeSlotRemote()
+        if TradeSlotRemote then return TradeSlotRemote end
+        pcall(function()
+            TradeSlotRemote = ReplicatedStorage
+                :WaitForChild("Shared"):WaitForChild("Remotes")
+                :WaitForChild("Networking"):WaitForChild("RF/TradeSetSlotOffer")
+        end)
+        return TradeSlotRemote
+    end
+
+    local function GetTradeReadyRemote()
+        if TradeReadyRemote then return TradeReadyRemote end
+        pcall(function()
+            TradeReadyRemote = ReplicatedStorage
+                :WaitForChild("Shared"):WaitForChild("Remotes")
+                :WaitForChild("Networking"):WaitForChild("RE/Trading/TradeReadyTrade")
+        end)
+        return TradeReadyRemote
+    end
+
+    -- STATE TRADE — nilai awal dari file settings
+    local tradeState = {
+        TargetName   = "",
+        SellType     = cfg.TradeSellType,
+        FilterRarity = cfg.TradeRarity,
+        FilterAnomali= cfg.TradeAnomali,
+        FilterMutation = cfg.TradeMutation,
+        LevelMin     = cfg.TradeLevelMin,
+        LevelMax     = cfg.TradeLevelMax,
+        SlotCount    = cfg.TradeSlotCount,
+        WaitAccept   = cfg.TradeWaitAccept,
+        WaitAfterAcc = cfg.TradeWaitAfterAcc,
+        SendDelay    = cfg.TradeSendDelay,
+    }
+
+    -- Helper: simpan tradeState ke cfg lalu save ke file
+    local function SaveTrade()
+        cfg.TradeSellType     = tradeState.SellType
+        cfg.TradeRarity       = tradeState.FilterRarity
+        cfg.TradeAnomali      = tradeState.FilterAnomali
+        cfg.TradeMutation     = tradeState.FilterMutation
+        cfg.TradeLevelMin     = tradeState.LevelMin
+        cfg.TradeLevelMax     = tradeState.LevelMax
+        cfg.TradeSlotCount    = tradeState.SlotCount
+        cfg.TradeWaitAccept   = tradeState.WaitAccept
+        cfg.TradeWaitAfterAcc = tradeState.WaitAfterAcc
+        cfg.TradeSendDelay    = tradeState.SendDelay
+        SaveSettings(cfg)
+    end
+
+    -- Helper: get player list di server (exclude diri sendiri)
+    local function GetServerPlayers()
+        local list = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= lp then
+                table.insert(list, p.Name)
+            end
+        end
+        if #list == 0 then table.insert(list, "(Tidak ada player lain)") end
+        return list
+    end
+
+    -- ---- SECTION: Target Player ----
+    TradeTab:Section({ Title = "Step 1 — Target Player" })
+
+    TradeTab:Paragraph({
+        Title = "Pilih Target",
+        Desc  = "Pilih dari dropdown atau ketik manual di bawah.",
+    })
+
+    local playerList = GetServerPlayers()
+    TradeTab:Dropdown({
+        Title  = "Player di Server",
+        Desc   = "Pilih dari player yang ada",
+        Icon   = "solar:users-group-rounded-bold",
+        Value  = playerList[1],
+        Values = playerList,
+        Multi  = false,
+        AllowNone = false,
+        Callback = function(v)
+            if v ~= "(Tidak ada player lain)" then
+                tradeState.TargetName = v
+            end
+        end,
+    })
+
+    TradeTab:Button({
+        Title = "Refresh List Player",
+        Desc  = "Update daftar player di server",
+        Icon  = "solar:refresh-bold",
+        Color = Color3.fromHex("#03DAC6"),
+        Callback = function()
+            task.spawn(function()
+                pcall(function() Window:Destroy() end)
+                task.wait(0.3)
+                BuildUI()
+            end)
+        end,
+    })
+
+    TradeTab:Input({
+        Title       = "Manual — Nama Player",
+        Desc        = "Ketik nama player target (override dropdown)",
+        Icon        = "solar:user-bold",
+        Placeholder = "Contoh: PlayerName123",
+        Callback    = function(v)
+            if v and v ~= "" then
+                tradeState.TargetName = v
+            end
+        end,
+    })
+
+    -- Helper: ambil list mutation dari ReplicatedStorage.Assets.Mutations
+    local function GetMutationList()
+        local list = {}
+        pcall(function()
+            local folder = ReplicatedStorage:WaitForChild("Assets", 3):WaitForChild("Mutations", 3)
+            for _, m in ipairs(folder:GetChildren()) do
+                if m:IsA("Folder") then
+                    -- subfolder (Electric, GearMutations) — ambil anak-anaknya
+                    for _, sub in ipairs(m:GetChildren()) do
+                        table.insert(list, sub.Name)
+                    end
+                else
+                    table.insert(list, m.Name)
+                end
+            end
+        end)
+        table.sort(list)
+        table.insert(list, 1, "None")
+        table.insert(list, 1, "All")
+        return list
+    end
+
+    -- ---- SECTION: Item Filter ----
+    TradeTab:Section({ Title = "Step 2 — Pilih Item yang Di-Trade" })
+
+    local tradeAnomalyValues = #scanCache > 1 and scanCache or { "All" }
+    if tradeAnomalyValues[1] ~= "All" then table.insert(tradeAnomalyValues, 1, "All") end
+
+    TradeTab:Dropdown({
+        Title  = "Tipe Item",
+        Desc   = "Block atau Anomali",
+        Icon   = "solar:sort-by-time-bold",
+        Value  = tradeState.SellType,
+        Values = { "Block", "Anomali" },
+        Multi  = false,
+        AllowNone = false,
+        Callback = function(v) tradeState.SellType = v SaveTrade() end,
+    })
+
+    TradeTab:Dropdown({
+        Title  = "Rarity Block",
+        Desc   = "Rarity block yang akan di-trade",
+        Icon   = "solar:diploma-bold",
+        Value  = tradeState.FilterRarity,
+        Values = BLOCK_RARITIES,
+        Multi  = false,
+        AllowNone = false,
+        Callback = function(v) tradeState.FilterRarity = v SaveTrade() end,
+    })
+
+    TradeTab:Dropdown({
+        Title  = "Jenis Anomali",
+        Desc   = "Pilih anomali (All = semua jenis)",
+        Icon   = "solar:ufo-bold",
+        Value  = tradeState.FilterAnomali,
+        Values = tradeAnomalyValues,
+        Multi  = false,
+        AllowNone = false,
+        Callback = function(v) tradeState.FilterAnomali = v SaveTrade() end,
+    })
+
+    local mutationList = GetMutationList()
+    -- Pastikan saved value valid, fallback ke "All"
+    local mutValid = false
+    for _, v in ipairs(mutationList) do if v == tradeState.FilterMutation then mutValid = true break end end
+    if not mutValid then tradeState.FilterMutation = "All" end
+
+    TradeTab:Dropdown({
+        Title  = "Mutation",
+        Desc   = "Filter mutation item (All = semua, None = tanpa mutation)",
+        Icon   = "solar:atom-bold",
+        Value  = tradeState.FilterMutation,
+        Values = mutationList,
+        Multi  = false,
+        AllowNone = false,
+        Callback = function(v) tradeState.FilterMutation = v SaveTrade() end,
+    })
+
+    TradeTab:Input({
+        Title       = "Level Minimum",
+        Desc        = "Item dengan level >= nilai ini yang di-trade (0 = semua)",
+        Icon        = "solar:arrow-up-bold",
+        Placeholder = tostring(tradeState.LevelMin),
+        Callback    = function(v)
+            local n = tonumber(v)
+            if n and n >= 0 then tradeState.LevelMin = math.floor(n) SaveTrade() end
+        end,
+    })
+
+    TradeTab:Input({
+        Title       = "Level Maksimum",
+        Desc        = "Item dengan level <= nilai ini yang di-trade (9999 = semua)",
+        Icon        = "solar:arrow-down-bold",
+        Placeholder = tostring(tradeState.LevelMax),
+        Callback    = function(v)
+            local n = tonumber(v)
+            if n and n >= 0 then tradeState.LevelMax = math.floor(n) SaveTrade() end
+        end,
+    })
+
+    -- ---- SECTION: Pengaturan ----
+    TradeTab:Section({ Title = "Step 3 — Pengaturan Trade" })
+
+    TradeTab:Input({
+        Title       = "Jumlah Slot Item",
+        Desc        = "Berapa item yang ditaruh di trade slot (maks sesuai game)",
+        Icon        = "solar:hashtag-bold",
+        Placeholder = tostring(tradeState.SlotCount),
+        Callback    = function(v)
+            local n = tonumber(v)
+            if n and n >= 1 then tradeState.SlotCount = math.floor(n) SaveTrade() end
+        end,
+    })
+
+    TradeTab:Input({
+        Title       = "Delay Tunggu Lawan Accept (detik)",
+        Desc        = "Jeda setelah send request — waktu buat lawan klik Accept. Min: 1s",
+        Icon        = "solar:hourglass-bold",
+        Placeholder = tostring(tradeState.WaitAccept),
+        Callback    = function(v)
+            local n = tonumber(v)
+            if n and n >= 1 then tradeState.WaitAccept = n SaveTrade() end
+        end,
+    })
+
+    TradeTab:Input({
+        Title       = "Delay Setelah Accept (detik)",
+        Desc        = "Jeda ekstra setelah acc sebelum set item — biar server siap. Min: 1s",
+        Icon        = "solar:clock-circle-bold",
+        Placeholder = tostring(tradeState.WaitAfterAcc),
+        Callback    = function(v)
+            local n = tonumber(v)
+            if n and n >= 1 then tradeState.WaitAfterAcc = n SaveTrade() end
+        end,
+    })
+
+    TradeTab:Input({
+        Title       = "Delay Antar Slot (detik)",
+        Desc        = "Jeda antar invoke set slot — min: 0.3s",
+        Icon        = "solar:transfer-horizontal-bold",
+        Placeholder = tostring(tradeState.SendDelay),
+        Callback    = function(v)
+            local n = tonumber(v)
+            if n and n >= 0.3 then tradeState.SendDelay = n SaveTrade() end
+        end,
+    })
+
+    -- ---- SECTION: Eksekusi ----
+    TradeTab:Section({ Title = "Step 4 — Jalankan Trade" })
+
+    TradeTab:Paragraph({
+        Title = "Urutan Otomatis",
+        Desc  = "Send → tunggu acc → stabilisasi → set item → accept.",
+    })
+
+    TradeTab:Button({
+        Title = "Mulai Auto Trade",
+        Desc  = "Kirim trade → tunggu acc → set item → accept",
+        Icon  = "solar:transfer-horizontal-bold",
+        Color = Color3.fromHex("#BB86FC"),
+        Callback = function()
+            task.spawn(function()
+
+                -- Validasi target
+                if tradeState.TargetName == "" then
+                    WindUI:Notify({
+                        Title   = "Auto Trade",
+                        Content = "Pilih atau ketik nama player target dulu!",
+                        Duration = 4,
+                    })
+                    return
+                end
+
+                -- Cari player object
+                local targetPlayer = Players:FindFirstChild(tradeState.TargetName)
+                if not targetPlayer then
+                    WindUI:Notify({
+                        Title   = "Auto Trade",
+                        Content = "Player '" .. tradeState.TargetName .. "' tidak ditemukan di server!",
+                        Duration = 4,
+                    })
+                    return
+                end
+
+                -- Scan inventory untuk ambil item
+                local blocks, anomals = ScanInventory()
+                local items = {}
+
+                if tradeState.SellType == "Block" then
+                    for _, item in ipairs(blocks) do
+                        local rarityMatch   = string.lower(item.rarity) == string.lower(tradeState.FilterRarity)
+                        local mutMatch      = tradeState.FilterMutation == "All"
+                            or string.lower(item.mutation or "none") == string.lower(tradeState.FilterMutation)
+                        local levelMatch    = item.level >= tradeState.LevelMin and item.level <= tradeState.LevelMax
+                        if rarityMatch and mutMatch and levelMatch then
+                            table.insert(items, item)
+                        end
+                    end
+                else
+                    for _, item in ipairs(anomals) do
+                        local nameMatch  = tradeState.FilterAnomali == "All"
+                            or string.lower(item.brainrotName) == string.lower(tradeState.FilterAnomali)
+                        local mutMatch   = tradeState.FilterMutation == "All"
+                            or string.lower(item.mutation or "none") == string.lower(tradeState.FilterMutation)
+                        local levelMatch = item.level >= tradeState.LevelMin and item.level <= tradeState.LevelMax
+                        if nameMatch and mutMatch and levelMatch then
+                            table.insert(items, item)
+                        end
+                    end
+                end
+
+                if #items == 0 then
+                    WindUI:Notify({
+                        Title   = "Auto Trade",
+                        Content = "Tidak ada item yang cocok di inventory!",
+                        Duration = 4,
+                    })
+                    return
+                end
+
+                WindUI:Notify({
+                    Title   = "Auto Trade Dimulai",
+                    Content = "Target: " .. tradeState.TargetName
+                        .. "\nItem tersedia: " .. #items
+                        .. " | Slot: " .. tradeState.SlotCount,
+                    Duration = 4,
+                })
+
+                -- STEP 1: Send trade request
+                local tradeRemote = GetTradeRemote()
+                if not tradeRemote then
+                    WindUI:Notify({ Title = "Trade Error", Content = "RF/TradeSendTrade tidak ditemukan!", Duration = 4 })
+                    return
+                end
+
+                local ok1, res1 = pcall(function()
+                    return tradeRemote:InvokeServer(targetPlayer)
+                end)
+
+                if not ok1 then
+                    WindUI:Notify({ Title = "Trade Error", Content = "Gagal send trade request!\n" .. tostring(res1), Duration = 5 })
+                    return
+                end
+
+                -- STEP 2: Tunggu lawan acc — beri waktu cukup sebelum lanjut
+                WindUI:Notify({
+                    Title   = "Trade Request Terkirim",
+                    Content = "Menunggu " .. tradeState.WaitAccept .. "s untuk " .. tradeState.TargetName .. " accept...",
+                    Duration = tradeState.WaitAccept,
+                })
+                task.wait(tradeState.WaitAccept)
+
+                -- STEP 3: Delay ekstra biar server/game selesai setup trade session
+                WindUI:Notify({
+                    Title   = "Stabilisasi Trade",
+                    Content = "Menunggu " .. tradeState.WaitAfterAcc .. "s biar server siap...",
+                    Duration = tradeState.WaitAfterAcc,
+                })
+                task.wait(tradeState.WaitAfterAcc)
+
+                -- STEP 4: Set item ke slot
+                local slotRemote = GetTradeSlotRemote()
+                if not slotRemote then
+                    WindUI:Notify({ Title = "Trade Error", Content = "RF/TradeSetSlotOffer tidak ditemukan!", Duration = 4 })
+                    return
+                end
+
+                local slotCount = math.min(tradeState.SlotCount, #items)
+                local successSlot = 0
+
+                WindUI:Notify({
+                    Title   = "Set Item",
+                    Content = "Memasukkan " .. slotCount .. " item ke slot trade...",
+                    Duration = 3,
+                })
+
+                for i = 1, slotCount do
+                    local item = items[i]
+                    local slotIndex = tostring(i)
+                    local itemId    = item.id
+
+                    local ok2, res2 = pcall(function()
+                        return slotRemote:InvokeServer(slotIndex, itemId)
+                    end)
+
+                    if ok2 then
+                        successSlot = successSlot + 1
+                    else
+                        warn("TradeSetSlot gagal slot " .. slotIndex .. ": " .. tostring(res2))
+                    end
+
+                    task.wait(tradeState.SendDelay)
+                end
+
+                WindUI:Notify({
+                    Title   = "Item Di-set",
+                    Content = successSlot .. "/" .. slotCount .. " slot berhasil.\nMenunggu cooldown 3s...",
+                    Duration = 3,
+                })
+
+                -- Tunggu 3 detik — cooldown tombol Accept dari game setelah place item
+                task.wait(3)
+
+                -- STEP 5a: Fire ready (pertama) — tandai kita siap
+                local readyRemote = GetTradeReadyRemote()
+                if not readyRemote then
+                    WindUI:Notify({ Title = "Trade Error", Content = "RE/Trading/TradeReadyTrade tidak ditemukan!", Duration = 4 })
+                    return
+                end
+
+                pcall(function()
+                    readyRemote:FireServer(true, 5)
+                end)
+
+                WindUI:Notify({
+                    Title   = "Ready!",
+                    Content = "Menunggu " .. tradeState.SendDelay .. "s lalu confirm accept...",
+                    Duration = tradeState.SendDelay,
+                })
+
+                task.wait(tradeState.SendDelay)
+
+                -- STEP 5b: Fire accept final — konfirmasi trade
+                pcall(function()
+                    readyRemote:FireServer(true, 5)
+                end)
+
+                WindUI:Notify({
+                    Title   = "Auto Trade Selesai!",
+                    Content = "Trade ke " .. tradeState.TargetName
+                        .. " sudah di-accept!\nSlot berhasil: " .. successSlot .. "/" .. slotCount,
+                    Duration = 6,
+                })
+
+            end)
+        end,
+    })
+
+    -- Tombol cancel / reset state
+    TradeTab:Button({
+        Title = "Reset State Trade",
+        Desc  = "Bersihkan target dan reset pengaturan",
+        Icon  = "solar:restart-bold",
+        Color = Color3.fromHex("#CF6679"),
+        Callback = function()
+            tradeState.TargetName = ""
+            WindUI:Notify({ Title = "Trade", Content = "State direset.", Duration = 3 })
         end,
     })
 
@@ -691,6 +1228,6 @@ BuildUI()
 
 WindUI:Notify({
     Title   = "Nebula Hub Loaded",
-    Content = "Restock + Claim + Anti AFK siap digunakan!",
+    Content = "Restock + Claim + Anti AFK + Auto Trade siap digunakan!",
     Duration = 5,
 })
